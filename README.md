@@ -1,49 +1,123 @@
-# Cloud CI/CD Lab — Spring Boot + PostgreSQL
+# Cloud CI/CD Lab — Spring Boot, Docker, GitHub Actions, AWS EC2
 
-Portfolio project for a DevOps Intern: REST API, Docker Compose, GitHub Actions CI, GHCR image publishing, Ubuntu deployment and health verification.
+Dự án portfolio DevOps Intern: một Spring Boot REST API lưu dữ liệu vào PostgreSQL, được đóng gói bằng Docker và tự động test, publish, deploy từ GitHub lên AWS EC2 thông qua OIDC + AWS Systems Manager (SSM).
 
-## 1. Run locally (Windows PowerShell)
+**Repository:** https://github.com/jasonnismee/cloud-cicd-lab  
+**Trạng thái xác nhận 31/10/2026:** 3 job GitHub Actions `Test and Build`, `Publish to GHCR`, `Deploy to EC2 via SSM` đã chạy xanh; ứng dụng và DB đã chạy trên EC2, endpoint health trả `UP`, HTTP public qua Nginx hoạt động.
 
-Requirements: Docker Desktop with WSL2 backend, Git; Java/Maven not necessary for Docker run.
+## 1. Kiến trúc
 
-```powershell
-Copy-Item .env.example .env
-# Edit .env and replace DB_PASSWORD with a strong password
- docker compose up --build -d
- docker compose ps
- curl.exe http://localhost:8080/actuator/health
- curl.exe -X POST http://localhost:8080/api/tasks -H "Content-Type: application/json" -d '{"title":"First deploy"}'
- curl.exe http://localhost:8080/api/tasks
+```text
+Developer push to main
+        |
+        v
+GitHub Actions
+  1. Test and Build: Maven verify + Docker build
+  2. Publish to GHCR: latest & sha-<commit>
+  3. Deploy: GitHub OIDC -> AWS STS/IAM -> SSM SendCommand
+                                                  |
+                                                  v
+                                       EC2 Ubuntu + SSM Agent
+                                                  |
+                                                  v
+                                          deploy/deploy.sh
+                                                  |
+                                                  v
+                                     Docker Compose: app + db
+
+Internet client -> EC2 Security Group port 80 -> Nginx -> 127.0.0.1:8080
+                                                          |
+                                                          v
+                                                     Spring Boot
+                                                          |
+                                                          v
+                                                   PostgreSQL (volume)
 ```
 
-Stop without deleting database: `docker compose down`. Destructive reset: `docker compose down -v`.
+## 2. Công nghệ
 
-## 2. CI/CD milestones
+- Java 21, Spring Boot 4.1.2, Maven, Spring Data JPA, Actuator.
+- PostgreSQL 17 Alpine, Docker multi-stage, Docker Compose.
+- GitHub Actions, GitHub Container Registry (GHCR), image tags `latest` và `sha-<commit>`.
+- AWS EC2 Ubuntu, EC2 Security Group, IAM roles, GitHub OIDC, AWS STS, Systems Manager Run Command, SSM Agent.
+- Nginx Reverse Proxy (HTTP port 80).
 
-- `.github/workflows/ci.yml`: run Maven unit tests and Docker build on main pushes and PRs.
-- `.github/workflows/publish.yml`: build/push `ghcr.io/OWNER/REPO:latest` and a SHA tag when main is pushed.
-- Both workflows are *independent*: publishing does not currently gate on successful CI. For production, connect them with a reusable workflow or job dependency.
+## 3. Cấu trúc các file chính
 
-## 3. Ubuntu VM deployment (manual and intentional)
+| File | Vai trò |
+|---|---|
+| `Dockerfile` | Build JAR bằng Maven ở stage 1, chạy ứng dụng bằng JRE 21 ở stage 2 |
+| `compose.yaml` | Chạy app + DB ở local, build image từ source |
+| `deploy/compose.yaml` | Trên EC2 pull image `APP_IMAGE` đã publish và chạy app + DB |
+| `deploy/deploy.sh` | Pull, `compose up`, đợi endpoint health `UP` |
+| `deploy/nginx.conf` | Proxy cổng 80 vào app chỉ bind loopback:8080 |
+| `.github/workflows/ci.yml` | Một workflow gồm 3 job test → publish → deploy |
+| `src/main/resources/application.properties` | Datasource qua biến môi trường, Actuator, Hibernate JPA |
 
-1. Install Docker Engine + Compose plugin and nginx on Ubuntu. Allow SSH/HTTP in the cloud firewall. Run Docker as a user with appropriate permissions.
-2. Copy `deploy/compose.yaml` and `deploy/deploy.sh` to `~/cloud-cicd-lab/deploy/` on the VM.
-3. Create `~/cloud-cicd-lab/deploy/.env` with `DB_PASSWORD=<strong secret>`; never commit it.
-4. Make GHCR image accessible using `docker login ghcr.io` (use a minimally scoped token if the package is private) or make the package public.
-5. From `deploy/`: `APP_IMAGE=ghcr.io/OWNER/REPO:sha-<commit> bash deploy.sh`.
-6. Install `deploy/nginx.conf` in `/etc/nginx/sites-available/cloud-cicd-lab` and enable it, then `sudo nginx -t && sudo systemctl reload nginx`.
-7. Test `curl http://VM_PUBLIC_IP/actuator/health` (HTTP demo only; add a domain + HTTPS before public production use).
+## 4. Chạy local bằng Docker Engine trong WSL2 Ubuntu
 
-Rollback: run `APP_IMAGE=ghcr.io/OWNER/REPO:sha-<previous_commit> bash deploy.sh`.
+Máy phát triển thực tế: **Windows 10 + WSL2 Ubuntu**, đã cài Docker Engine và Docker Compose trực tiếp trong Ubuntu; **không yêu cầu Docker Desktop**.
 
-## API
+```bash
+cd ~/projects/cloud-cicd-lab
+cp .env.example .env
+# Đổi DB_PASSWORD trong .env; không commit mật khẩu
+docker compose up --build -d
+docker compose ps
+curl -fsS http://127.0.0.1:8080/actuator/health
+curl -fsS http://127.0.0.1:8080/api/tasks
+```
 
-- `GET /actuator/health`
-- `GET /api/tasks`
-- `POST /api/tasks` JSON `{"title":"demo"}`
-- `PATCH /api/tasks/1` JSON `{"completed":true}`
-- `DELETE /api/tasks/1`
+Kiểm thử ghi dữ liệu:
 
-## Limits / planned improvements
+```bash
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Deploy Spring Boot with Docker"}'
+docker compose restart
+# Chờ ứng dụng khởi động xong, rồi kiểm tra dữ liệu còn tồn tại
+curl http://127.0.0.1:8080/api/tasks
+```
 
-This is a lab, **not production ready**: the API has no authentication, `ddl-auto=update` should be replaced with migrations, HTTPS is not configured, deployment is manual, and Docker Compose is single-host. Do not expose sensitive data. To add: Flyway, TLS, image vulnerability scan, automatic gated CD, backup/restore and integration tests.
+Lưu ý: `docker compose down -v` xóa cả volume database, **không dùng khi cần giữ dữ liệu**.
+
+## 5. Pipeline CI/CD
+
+Workflow `.github/workflows/ci.yml` kích hoạt khi `push`/`pull_request` vào `main`.
+
+- **test:** checkout code, Java 21, `mvn -B -ntp verify`, `docker build`. Chạy cho PR và push.
+- **publish:** `needs: test`, chỉ chạy khi `push`, login GHCR bằng `GITHUB_TOKEN`, build/push `latest` và `sha-${{ github.sha }}`.
+- **deploy:** `needs: publish`, `id-token: write` để dùng GitHub OIDC, assume `CloudCICDLabGitHubRole`, gửi SSM command đến `EC2_INSTANCE_ID`. SSM Agent thực thi `deploy.sh` với image SHA. Workflow theo dõi kết quả và thất bại nếu lệnh SSM thất bại.
+
+**GitHub Secrets được workflow dùng:** `AWS_REGION`, `EC2_INSTANCE_ID`. Không lưu AWS access key tĩnh. Các secrets SSH từng dùng cho kế hoạch SSH deploy không còn cần thiết cho workflow OIDC/SSM hiện hành.
+
+## 6. Chạy trên EC2
+
+EC2 cần Docker Engine + Docker Compose plugin, Nginx, SSM Agent đang online với instance role có policy `AmazonSSMManagedInstanceCore`. File `/home/ubuntu/cloud-cicd-lab/deploy/.env` cần `DB_PASSWORD` và `APP_IMAGE` nếu chạy Compose thủ công.
+
+```bash
+cd /home/ubuntu/cloud-cicd-lab/deploy
+sudo docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:8080/actuator/health
+curl -fsS http://127.0.0.1/actuator/health
+sudo docker inspect deploy-app-1 --format '{{.Config.Image}}'
+```
+
+Luồng request: client → Nginx HTTP/80 → `127.0.0.1:8080` → Spring Boot → `db:5432` (internal Compose). Không mở công khai cổng 8080/5432.
+
+## 7. Kết quả đã kiểm chứng
+
+- Local Docker Compose build, PostgreSQL healthy, Spring Boot health `UP`.
+- POST task tạo `id=1`, GET đọc được và task vẫn tồn tại sau `docker compose restart`.
+- GHCR publish thành công; application + DB chạy trên EC2, HTTP health qua Nginx hoạt động.
+- CI/CD có ba job xanh, OIDC + SSM deploy thành công.
+
+## 8. Giới hạn và hướng phát triển
+
+Đây là **lab, chưa phải hệ thống production-ready**. Chưa cấu hình HTTPS và authentication; Hibernate `ddl-auto=update` vẫn dùng cho demo. Chưa có test rollback tự động, DB backup/restore, canary/blue-green, Kubernetes, Terraform, quan sát nâng cao, hoặc mô hình HA. Không lưu dữ liệu thật/nhạy cảm trong demo public.
+
+Các hạng mục nâng cấp tùy chọn: TLS + domain, API authentication, Flyway migrations, database backup, integration tests, image scanning, GitHub environment approval, digest pinning, automated rollback.
+
+## 9. Ứng tuyển & trình bày
+
+Điểm cần nêu trong CV: đã xây dựng CI/CD gồm test/build/publish/deploy theo thứ tự; deploy Docker image lên EC2 qua AWS OIDC/SSM (không SSH từ GitHub runner, không access key tĩnh); kết nối container app–PostgreSQL và Nginx proxy, kiểm chứng persistence/health. Không mô tả những tính năng chưa triển khai như đã hoàn thành.
